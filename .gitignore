@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training artifacts
+runs/
+logs/
+scripts/logs/
+scripts/.venv/
+wandb/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local override settings
+.env
+.env.local
