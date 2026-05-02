@@ -64,6 +64,12 @@ class PPOConfig:
     checkpoint_interval_updates: int = 25
     save_final_checkpoint: bool = True
 
+    # Weights & Biases.
+    use_wandb: bool = False
+    wandb_project: str = "craftax-ppo"
+    wandb_entity: str = ""
+    wandb_mode: str = "online"  # "online", "offline", or "disabled"
+
     # Safety checks.
     require_num_devices: int = 8  # set to 0 to allow any number of devices
 

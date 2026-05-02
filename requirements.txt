@@ -6,3 +6,4 @@ flax>=0.8.5
 optax>=0.2.3
 craftax>=1.5.0
 numpy>=1.26
+wandb>=0.18

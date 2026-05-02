@@ -447,6 +447,20 @@ def main() -> None:
     print(f"  effective_total_steps:    {effective_total_timesteps:,}")
     print(f"  run_dir:                  {run_dir}")
 
+    wandb_run = None
+    if ppo.use_wandb:
+        import wandb
+        init_kwargs = dict(
+            project=ppo.wandb_project,
+            name=ppo.run_name,
+            config=asdict(cfg),
+            mode=ppo.wandb_mode,
+            dir=str(run_dir),
+        )
+        if ppo.wandb_entity:
+            init_kwargs["entity"] = ppo.wandb_entity
+        wandb_run = wandb.init(**init_kwargs)
+
     rng = jax.random.PRNGKey(ppo.seed)
     rng, init_rng, runner_rng = jax.random.split(rng, 3)
 
@@ -483,6 +497,8 @@ def main() -> None:
     }
     append_csv(run_dir / "metrics.csv", first_row)
     print(json.dumps(first_row, indent=2))
+    if wandb_run is not None:
+        wandb_run.log(first_row, step=global_step)
 
     for update in range(2, num_updates + 1):
         train_state, runner_state, metrics = p_update_once(train_state, runner_state)
@@ -505,6 +521,8 @@ def main() -> None:
             }
             append_csv(run_dir / "metrics.csv", row)
             print(json.dumps(row, indent=2))
+            if wandb_run is not None:
+                wandb_run.log(row, step=global_step)
             last_log_time = now
             last_log_step = global_step
 
@@ -519,6 +537,9 @@ def main() -> None:
         ckpt_dir = run_dir / "checkpoints" / "final"
         save_checkpoint(ckpt_dir, train_state, cfg, num_updates, global_step)
         print(f"Saved final checkpoint: {ckpt_dir}")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
