@@ -34,6 +34,7 @@ class PPOConfig:
     # Environment.
     env_name: str = "Craftax-Classic-Symbolic-v1"
     seed: int = 0
+    env_max_timesteps: int = 10000  # Craftax-Classic default; raise to extend timeout.
 
     # Scale. For a quick smoke test, override total_timesteps to e.g. 1048576.
     total_timesteps: int = 1_000_000_000
@@ -55,7 +56,16 @@ class PPOConfig:
     # Optimizer.
     lr: float = 2e-4
     adam_eps: float = 1e-5
-    anneal_lr: bool = True
+    anneal_lr: bool = False  # Paper note: anneal hurts at long horizons.
+
+    # Self-Imitation Learning auxiliary loss (Oh et al. 2018).
+    # Enable by setting sil_coef > 0. Buffer is a per-device circular buffer of
+    # rollout transitions; the SIL loss masks by clip(advantage, 0, inf) so only
+    # transitions where the agent outperformed its value estimate contribute.
+    sil_coef: float = 0.0  # Set e.g. 0.1 to enable.
+    sil_vf_coef: float = 0.5
+    sil_buffer_capacity_per_device: int = 16384  # transitions per device
+    sil_minibatch_size: int = 0  # 0 -> match PPO minibatch size
 
     # Logging/checkpointing.
     run_name: str = "craftax_classic_ppo_pmap"
@@ -63,6 +73,12 @@ class PPOConfig:
     log_interval_updates: int = 1
     checkpoint_interval_updates: int = 25
     save_final_checkpoint: bool = True
+
+    # Weights & Biases.
+    use_wandb: bool = False
+    wandb_project: str = "craftax-ppo"
+    wandb_entity: str = ""
+    wandb_mode: str = "online"  # "online", "offline", or "disabled"
 
     # Safety checks.
     require_num_devices: int = 8  # set to 0 to allow any number of devices

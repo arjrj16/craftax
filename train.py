@@ -36,12 +36,25 @@ import numpy as np
 import optax
 
 from craftax.craftax_env import make_craftax_env_from_name
+from craftax.craftax_classic.constants import Achievement
 
 from config import CONFIG, Config, ModelConfig, PPOConfig
 from model import ActorCritic
 
 
 AXIS_NAME = "devices"
+
+# Achievement keys produced by Craftax-Classic's `compute_score` info dict.
+# Each value is `state.achievements[i] * done * 100.0`, so it is nonzero only
+# at the terminal step of each episode.
+ACHIEVEMENT_NAMES = [a.name.lower() for a in Achievement]
+ACHIEVEMENT_INFO_KEYS = [f"Achievements/{n}" for n in ACHIEVEMENT_NAMES]
+NUM_ACHIEVEMENTS = len(ACHIEVEMENT_NAMES)
+
+
+def _stack_achievements(info: dict) -> jnp.ndarray:
+    """Stack the per-achievement entries of an info dict into [..., 22]."""
+    return jnp.stack([info[k] for k in ACHIEVEMENT_INFO_KEYS], axis=-1)
 
 
 class RunnerState(NamedTuple):
@@ -50,6 +63,13 @@ class RunnerState(NamedTuple):
     rng: jax.Array
     episode_return: jnp.ndarray
     episode_length: jnp.ndarray
+    # Self-Imitation Learning circular buffer (per device). When sil_coef == 0
+    # we still allocate a tiny capacity-1 buffer so the pytree shape is fixed.
+    sil_obs: jnp.ndarray
+    sil_action: jnp.ndarray
+    sil_target: jnp.ndarray
+    sil_advantage: jnp.ndarray
+    sil_write_idx: jnp.ndarray
 
 
 class Transition(NamedTuple):
@@ -62,6 +82,8 @@ class Transition(NamedTuple):
     terminal_return: jnp.ndarray
     terminal_length: jnp.ndarray
     terminal: jnp.ndarray
+    terminal_achievements: jnp.ndarray  # [num_envs, 22], values in {0, 100}
+    terminal_score: jnp.ndarray         # [num_envs], geometric-mean score
 
 
 class PPOBatch(NamedTuple):
@@ -71,6 +93,13 @@ class PPOBatch(NamedTuple):
     old_value: jnp.ndarray
     advantage: jnp.ndarray
     target: jnp.ndarray
+
+
+class SilBatch(NamedTuple):
+    obs: jnp.ndarray
+    action: jnp.ndarray
+    target: jnp.ndarray
+    advantage: jnp.ndarray
 
 
 def _parse_int_like(x: str) -> int:
@@ -164,7 +193,7 @@ def create_train_state(
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
+def make_pmapped_fns(cfg: Config, env: Any, env_params: Any, obs_shape: tuple[int, ...]):
     """Build pmapped init/update functions around a Craftax env closure."""
 
     num_envs = cfg.ppo.num_envs_per_device
@@ -172,6 +201,19 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
     batch_size = num_envs * num_steps
     assert batch_size % cfg.ppo.num_minibatches == 0
     minibatch_size = batch_size // cfg.ppo.num_minibatches
+
+    sil_enabled = cfg.ppo.sil_coef > 0.0
+    sil_capacity = cfg.ppo.sil_buffer_capacity_per_device if sil_enabled else 1
+    if sil_enabled:
+        sil_mb_size = (
+            cfg.ppo.sil_minibatch_size if cfg.ppo.sil_minibatch_size > 0 else minibatch_size
+        )
+        if sil_mb_size > sil_capacity:
+            raise ValueError(
+                f"sil_minibatch_size={sil_mb_size} exceeds buffer capacity {sil_capacity}."
+            )
+    else:
+        sil_mb_size = 1
 
     reset_one = lambda key: env.reset(key, env_params)
     step_one = lambda key, state, action: env.step(key, state, action, env_params)
@@ -182,12 +224,23 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
         rng, reset_rng = jax.random.split(rng)
         reset_keys = jax.random.split(reset_rng, num_envs)
         obs, env_state = reset_batch(reset_keys)
+        # Init SIL buffer with zeros. advantage=0 means SIL loss contributes
+        # nothing until real rollout transitions overwrite it.
+        sil_obs = jnp.zeros((sil_capacity, *obs_shape), dtype=jnp.float32)
+        sil_action = jnp.zeros((sil_capacity,), dtype=jnp.int32)
+        sil_target = jnp.zeros((sil_capacity,), dtype=jnp.float32)
+        sil_advantage = jnp.zeros((sil_capacity,), dtype=jnp.float32)
         return RunnerState(
             env_state=env_state,
             obs=obs,
             rng=rng,
             episode_return=jnp.zeros((num_envs,), dtype=jnp.float32),
             episode_length=jnp.zeros((num_envs,), dtype=jnp.int32),
+            sil_obs=sil_obs,
+            sil_action=sil_action,
+            sil_target=sil_target,
+            sil_advantage=sil_advantage,
+            sil_write_idx=jnp.zeros((), dtype=jnp.int32),
         )
 
     def calculate_gae(transitions: Transition, last_value: jnp.ndarray):
@@ -218,7 +271,7 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
             log_prob = categorical_log_prob(logits, action)
 
             step_keys = jax.random.split(step_rng, num_envs)
-            next_obs, next_env_state, reward, done, _info = step_batch(
+            next_obs, next_env_state, reward, done, info = step_batch(
                 step_keys, runner_state.env_state, action
             )
             reward = reward.astype(jnp.float32)
@@ -229,12 +282,23 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
             terminal_return = jnp.where(done, updated_episode_return, 0.0)
             terminal_length = jnp.where(done, updated_episode_length, 0)
 
+            # Per-env per-achievement value at this step. The env populates each
+            # info["Achievements/<name>"] with state.achievements[i] * done * 100,
+            # so this is nonzero only at terminal steps.
+            terminal_achievements = _stack_achievements(info).astype(jnp.float32)
+            terminal_score = info["score"].astype(jnp.float32)
+
             next_runner_state = RunnerState(
                 env_state=next_env_state,
                 obs=next_obs,
                 rng=rng,
                 episode_return=updated_episode_return * (1.0 - done_f),
                 episode_length=updated_episode_length * (1 - done.astype(jnp.int32)),
+                sil_obs=runner_state.sil_obs,
+                sil_action=runner_state.sil_action,
+                sil_target=runner_state.sil_target,
+                sil_advantage=runner_state.sil_advantage,
+                sil_write_idx=runner_state.sil_write_idx,
             )
             transition = Transition(
                 obs=runner_state.obs,
@@ -246,6 +310,8 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
                 terminal_return=terminal_return,
                 terminal_length=terminal_length,
                 terminal=done,
+                terminal_achievements=terminal_achievements,
+                terminal_score=terminal_score,
             )
             return (train_state, next_runner_state), transition
 
@@ -268,6 +334,31 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
             target=flatten_time_env(targets),
         )
 
+        # Stash transitions for SIL before advantage normalization. SIL needs
+        # raw (R - V) margins; PPO uses normalized advantages.
+        if sil_enabled:
+            sil_candidate_obs = batch.obs
+            sil_candidate_action = batch.action
+            sil_candidate_target = batch.target
+            sil_candidate_advantage = batch.advantage
+            n_new = sil_candidate_obs.shape[0]
+            write_idx = runner_state.sil_write_idx
+            indices = (write_idx + jnp.arange(n_new, dtype=jnp.int32)) % sil_capacity
+            new_sil_obs = runner_state.sil_obs.at[indices].set(sil_candidate_obs)
+            new_sil_action = runner_state.sil_action.at[indices].set(sil_candidate_action)
+            new_sil_target = runner_state.sil_target.at[indices].set(sil_candidate_target)
+            new_sil_advantage = runner_state.sil_advantage.at[indices].set(
+                sil_candidate_advantage
+            )
+            new_write_idx = write_idx + jnp.int32(n_new)
+            runner_state = runner_state._replace(
+                sil_obs=new_sil_obs,
+                sil_action=new_sil_action,
+                sil_target=new_sil_target,
+                sil_advantage=new_sil_advantage,
+                sil_write_idx=new_write_idx,
+            )
+
         if cfg.ppo.normalize_advantages:
             adv_mean = batch.advantage.mean()
             adv_var = jnp.mean(jnp.square(batch.advantage - adv_mean))
@@ -278,48 +369,71 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
                 advantage=(batch.advantage - adv_mean) / jnp.sqrt(adv_var + 1e-8)
             )
 
-        def loss_fn(params: Any, mb: PPOBatch):
-            logits, value = train_state.apply_fn({"params": params}, mb.obs)
-            log_prob = categorical_log_prob(logits, mb.action)
+        def loss_fn(params: Any, mbs: tuple[PPOBatch, SilBatch]):
+            ppo_mb, sil_mb = mbs
+            logits, value = train_state.apply_fn({"params": params}, ppo_mb.obs)
+            log_prob = categorical_log_prob(logits, ppo_mb.action)
             entropy = categorical_entropy(logits).mean()
 
-            ratio = jnp.exp(log_prob - mb.old_log_prob)
-            policy_loss_1 = ratio * mb.advantage
+            ratio = jnp.exp(log_prob - ppo_mb.old_log_prob)
+            policy_loss_1 = ratio * ppo_mb.advantage
             policy_loss_2 = (
                 jnp.clip(ratio, 1.0 - cfg.ppo.clip_eps, 1.0 + cfg.ppo.clip_eps)
-                * mb.advantage
+                * ppo_mb.advantage
             )
             policy_loss = -jnp.minimum(policy_loss_1, policy_loss_2).mean()
 
             if cfg.ppo.clip_value_loss:
-                value_clipped = mb.old_value + jnp.clip(
-                    value - mb.old_value, -cfg.ppo.clip_eps, cfg.ppo.clip_eps
+                value_clipped = ppo_mb.old_value + jnp.clip(
+                    value - ppo_mb.old_value, -cfg.ppo.clip_eps, cfg.ppo.clip_eps
                 )
                 value_loss = jnp.maximum(
-                    jnp.square(value - mb.target),
-                    jnp.square(value_clipped - mb.target),
+                    jnp.square(value - ppo_mb.target),
+                    jnp.square(value_clipped - ppo_mb.target),
                 ).mean()
             else:
-                value_loss = jnp.square(value - mb.target).mean()
+                value_loss = jnp.square(value - ppo_mb.target).mean()
             value_loss = 0.5 * value_loss
 
-            total_loss = policy_loss + cfg.ppo.vf_coef * value_loss - cfg.ppo.ent_coef * entropy
-            approx_kl = (mb.old_log_prob - log_prob).mean()
-            clip_fraction = (jnp.abs(ratio - 1.0) > cfg.ppo.clip_eps).mean()
-            explained_var = 1.0 - jnp.var(mb.target - value) / (jnp.var(mb.target) + 1e-8)
+            total_loss = (
+                policy_loss + cfg.ppo.vf_coef * value_loss - cfg.ppo.ent_coef * entropy
+            )
+
             aux = {
                 "loss": total_loss,
                 "policy_loss": policy_loss,
                 "value_loss": value_loss,
                 "entropy": entropy,
-                "approx_kl": approx_kl,
-                "clip_fraction": clip_fraction,
-                "explained_var": explained_var,
+                "approx_kl": (ppo_mb.old_log_prob - log_prob).mean(),
+                "clip_fraction": (jnp.abs(ratio - 1.0) > cfg.ppo.clip_eps).mean(),
+                "explained_var": (
+                    1.0 - jnp.var(ppo_mb.target - value) / (jnp.var(ppo_mb.target) + 1e-8)
+                ),
             }
+
+            if sil_enabled:
+                sil_logits, sil_value = train_state.apply_fn(
+                    {"params": params}, sil_mb.obs
+                )
+                sil_log_prob = categorical_log_prob(sil_logits, sil_mb.action)
+                # (R - V)_+, with grad through V for the value loss but not for
+                # the policy loss (Oh et al. 2018).
+                sil_pos_adv = jnp.clip(sil_mb.target - sil_value, 0.0, jnp.inf)
+                sil_pos_adv_pg = jax.lax.stop_gradient(sil_pos_adv)
+                sil_policy_loss = -(sil_log_prob * sil_pos_adv_pg).mean()
+                sil_value_loss = 0.5 * jnp.square(sil_pos_adv).mean()
+                sil_loss = sil_policy_loss + cfg.ppo.sil_vf_coef * sil_value_loss
+                total_loss = total_loss + cfg.ppo.sil_coef * sil_loss
+                aux["sil_policy_loss"] = sil_policy_loss
+                aux["sil_value_loss"] = sil_value_loss
+                aux["sil_active_frac"] = (sil_pos_adv_pg > 0).astype(jnp.float32).mean()
+                aux["sil_pos_adv_mean"] = sil_pos_adv_pg.mean()
+                aux["loss"] = total_loss
+
             return total_loss, aux
 
-        def update_minibatch(state: TrainState, mb: PPOBatch):
-            (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, mb)
+        def update_minibatch(state: TrainState, mbs: tuple[PPOBatch, SilBatch]):
+            (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, mbs)
             grads = jax.lax.pmean(grads, AXIS_NAME)
             aux = jax.lax.pmean(aux, AXIS_NAME)
             state = state.apply_gradients(grads=grads)
@@ -327,14 +441,34 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
 
         def update_epoch(state_and_rng: tuple[TrainState, jax.Array], _: Any):
             state, rng = state_and_rng
-            rng, perm_rng = jax.random.split(rng)
+            rng, perm_rng, sil_rng = jax.random.split(rng, 3)
             permutation = jax.random.permutation(perm_rng, batch_size)
             shuffled = jax.tree.map(lambda x: jnp.take(x, permutation, axis=0), batch)
-            minibatches = jax.tree.map(
+            ppo_minibatches = jax.tree.map(
                 lambda x: x.reshape((cfg.ppo.num_minibatches, minibatch_size) + x.shape[1:]),
                 shuffled,
             )
-            state, aux = jax.lax.scan(update_minibatch, state, minibatches)
+
+            # SIL minibatches: random uniform indices into the buffer with
+            # replacement. Indices into a buffer of constant capacity, so this
+            # is jit-static. When SIL is disabled, capacity is 1 and the loss
+            # path skips the SIL term entirely.
+            sil_indices = jax.random.randint(
+                sil_rng,
+                (cfg.ppo.num_minibatches, sil_mb_size),
+                minval=0,
+                maxval=sil_capacity,
+            )
+            sil_minibatches = SilBatch(
+                obs=runner_state.sil_obs[sil_indices],
+                action=runner_state.sil_action[sil_indices],
+                target=runner_state.sil_target[sil_indices],
+                advantage=runner_state.sil_advantage[sil_indices],
+            )
+
+            state, aux = jax.lax.scan(
+                update_minibatch, state, (ppo_minibatches, sil_minibatches)
+            )
             return (state, rng), aux
 
         (train_state, rng), aux = jax.lax.scan(
@@ -349,9 +483,16 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
         local_episode_count = transitions.terminal.astype(jnp.float32).sum()
         local_return_sum = transitions.terminal_return.sum()
         local_length_sum = transitions.terminal_length.astype(jnp.float32).sum()
+        # Per-achievement: terminal_achievements is 100 at terminal step (per
+        # achievement that was completed in that episode), 0 elsewhere. Sum
+        # across (time, env) and divide by 100 to get per-achievement counts.
+        local_ach_sum = transitions.terminal_achievements.sum(axis=(0, 1)) / 100.0
+        local_score_sum = transitions.terminal_score.sum() / 100.0
         global_episode_count = jax.lax.psum(local_episode_count, AXIS_NAME)
         global_return_sum = jax.lax.psum(local_return_sum, AXIS_NAME)
         global_length_sum = jax.lax.psum(local_length_sum, AXIS_NAME)
+        global_ach_sum = jax.lax.psum(local_ach_sum, AXIS_NAME)
+        global_score_sum = jax.lax.psum(local_score_sum, AXIS_NAME)
         denom = jnp.maximum(global_episode_count, 1.0)
 
         metrics = jax.tree.map(lambda x: x.mean(), aux)
@@ -359,6 +500,9 @@ def make_pmapped_fns(cfg: Config, env: Any, env_params: Any):
         metrics["mean_episode_return"] = global_return_sum / denom
         metrics["mean_episode_length"] = global_length_sum / denom
         metrics["mean_rollout_reward"] = jax.lax.pmean(transitions.reward.mean(), AXIS_NAME)
+        metrics["mean_episode_score"] = global_score_sum / denom
+        for i, name in enumerate(ACHIEVEMENT_NAMES):
+            metrics[f"achv/{name}"] = global_ach_sum[i] / denom
         return train_state, runner_state, metrics
 
     return (
@@ -409,6 +553,8 @@ def main() -> None:
 
     env = make_craftax_env_from_name(ppo.env_name, auto_reset=True)
     env_params = env.default_params
+    if ppo.env_max_timesteps != env_params.max_timesteps:
+        env_params = env_params.replace(max_timesteps=ppo.env_max_timesteps)
     obs_shape = tuple(env.observation_space(env_params).shape)
     num_actions = int(env.action_space(env_params).n)
 
@@ -445,7 +591,26 @@ def main() -> None:
     print(f"  global_steps/update:      {global_steps_per_update:,}")
     print(f"  num_updates:              {num_updates:,}")
     print(f"  effective_total_steps:    {effective_total_timesteps:,}")
+    print(f"  env_max_timesteps:        {env_params.max_timesteps}")
+    print(f"  anneal_lr:                {ppo.anneal_lr}")
+    print(f"  sil_coef:                 {ppo.sil_coef}")
+    if ppo.sil_coef > 0:
+        print(f"  sil_buffer_capacity:      {ppo.sil_buffer_capacity_per_device}")
     print(f"  run_dir:                  {run_dir}")
+
+    wandb_run = None
+    if ppo.use_wandb:
+        import wandb
+        init_kwargs = dict(
+            project=ppo.wandb_project,
+            name=ppo.run_name,
+            config=asdict(cfg),
+            mode=ppo.wandb_mode,
+            dir=str(run_dir),
+        )
+        if ppo.wandb_entity:
+            init_kwargs["entity"] = ppo.wandb_entity
+        wandb_run = wandb.init(**init_kwargs)
 
     rng = jax.random.PRNGKey(ppo.seed)
     rng, init_rng, runner_rng = jax.random.split(rng, 3)
@@ -453,7 +618,7 @@ def main() -> None:
     train_state = create_train_state(init_rng, obs_shape, num_actions, cfg, num_updates)
     train_state = jax_utils.replicate(train_state)
 
-    p_init_runner_state, p_update_once = make_pmapped_fns(cfg, env, env_params)
+    p_init_runner_state, p_update_once = make_pmapped_fns(cfg, env, env_params, obs_shape)
     runner_keys = jax.random.split(runner_rng, num_devices)
     runner_state = p_init_runner_state(runner_keys)
 
@@ -483,6 +648,8 @@ def main() -> None:
     }
     append_csv(run_dir / "metrics.csv", first_row)
     print(json.dumps(first_row, indent=2))
+    if wandb_run is not None:
+        wandb_run.log(first_row, step=global_step)
 
     for update in range(2, num_updates + 1):
         train_state, runner_state, metrics = p_update_once(train_state, runner_state)
@@ -505,6 +672,8 @@ def main() -> None:
             }
             append_csv(run_dir / "metrics.csv", row)
             print(json.dumps(row, indent=2))
+            if wandb_run is not None:
+                wandb_run.log(row, step=global_step)
             last_log_time = now
             last_log_step = global_step
 
@@ -519,6 +688,9 @@ def main() -> None:
         ckpt_dir = run_dir / "checkpoints" / "final"
         save_checkpoint(ckpt_dir, train_state, cfg, num_updates, global_step)
         print(f"Saved final checkpoint: {ckpt_dir}")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
